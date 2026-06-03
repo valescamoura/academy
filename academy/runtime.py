@@ -33,6 +33,8 @@ from academy.exception import MailboxTerminatedError
 from academy.exception import raise_exceptions
 from academy.exchange.transport import AgentRegistrationT
 from academy.exchange.transport import ExchangeTransportT
+from academy.flowcept import AcademyFlowceptProvenance
+from academy.flowcept import _RuntimeState
 from academy.handle import exchange_context
 from academy.identifier import EntityId
 from academy.message import AcademyErrorResponse
@@ -166,6 +168,7 @@ class Runtime(Generic[AgentT], NoPickleMixin):
         self._shutdown_event = asyncio.Event()
         self._shutdown_options = _ShutdownState()
         self._agent_startup_called = False
+        self._flowcept_state = _RuntimeState(enabled=False)
 
         self._action_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._loop_tasks: dict[str, asyncio.Task[None]] = {}
@@ -261,6 +264,16 @@ class Runtime(Generic[AgentT], NoPickleMixin):
         exception_serialization = (
             body.exception_serialization or result_serialization
         )
+        action_task = AcademyFlowceptProvenance.start_action(
+            state=self._flowcept_state,
+            task_id=f"academy-action:{request.tag}",
+            action=body.action,
+            source_agent_id=request.src,
+            agent_id=self.agent_id,
+            args=body.get_args(),
+            kwargs=body.get_kwargs(),
+            request=request,
+        )
         try:
             # Do not run the method until the startup sequence has finished
             await self._started_event.wait()
@@ -278,11 +291,31 @@ class Runtime(Generic[AgentT], NoPickleMixin):
                     result=result,
                 ),
             )
+            AcademyFlowceptProvenance.end_action(
+                action_task,
+                generated={"result": result},
+                custom_metadata={
+                    "academy_response": {
+                        "response_kind": response.header.kind,
+                        "result_serialization": str(result_serialization),
+                    },
+                },
+            )
         except asyncio.CancelledError:
             response = request.create_response(
                 AcademyErrorResponse(
                     error_code=ErrorCode.ACTION_CANCELLED,
                 ),
+            )
+            AcademyFlowceptProvenance.end_action(
+                action_task,
+                exception=asyncio.CancelledError(),
+                custom_metadata={
+                    "academy_response": {
+                        "response_kind": response.header.kind,
+                        "error_code": ErrorCode.ACTION_CANCELLED.name,
+                    },
+                },
             )
             logger.debug(
                 'Cancelled action %s with invocation id %s',
@@ -299,6 +332,16 @@ class Runtime(Generic[AgentT], NoPickleMixin):
                     serialization=exception_serialization,
                     exception=e,
                 ),
+            )
+            AcademyFlowceptProvenance.end_action(
+                action_task,
+                exception=e,
+                custom_metadata={
+                    "academy_response": {
+                        "response_kind": response.header.kind,
+                        "exception_serialization": str(exception_serialization),
+                    },
+                },
             )
             logger.debug(
                 (
@@ -356,13 +399,35 @@ class Runtime(Generic[AgentT], NoPickleMixin):
         name: str,
         method: Callable[[asyncio.Event], Awaitable[None]],
     ) -> None:
+        loop_task = AcademyFlowceptProvenance.start_loop(
+            state=self._flowcept_state,
+            loop_name=name,
+            agent_id=self.agent_id,
+        )
         try:
             # Do not run the method until the startup sequence has finished
             await self._started_event.wait()
             await method(self._shutdown_event)
         except asyncio.CancelledError:
+            AcademyFlowceptProvenance.end_action(
+                loop_task,
+                custom_metadata={
+                    "academy_response": {
+                        "loop_state": "cancelled",
+                    },
+                },
+            )
             pass
         except Exception as e:
+            AcademyFlowceptProvenance.end_action(
+                loop_task,
+                exception=e,
+                custom_metadata={
+                    "academy_response": {
+                        "loop_state": "exception",
+                    },
+                },
+            )
             self._loop_exceptions.append((name, e))
             logger.exception(
                 'Error in loop %r (signaling shutdown: %s)',
@@ -375,6 +440,15 @@ class Runtime(Generic[AgentT], NoPickleMixin):
             )
             if self.config.shutdown_on_loop_error:
                 self.signal_shutdown(expected=False)
+        else:
+            AcademyFlowceptProvenance.end_action(
+                loop_task,
+                custom_metadata={
+                    "academy_response": {
+                        "loop_state": "finished",
+                    },
+                },
+            )
 
     async def _request_handler(self, request: Message[Request]) -> None:
         body = request.get_body()
@@ -553,6 +627,8 @@ class Runtime(Generic[AgentT], NoPickleMixin):
         if self._shutdown_event.is_set():
             raise RuntimeError('Agent has already been shutdown.')
 
+        self._flowcept_state = AcademyFlowceptProvenance.start_runtime(self)
+
         logger.debug(
             'Starting agent... (%s; %s)',
             self.agent_id,
@@ -595,6 +671,17 @@ class Runtime(Generic[AgentT], NoPickleMixin):
         await self.agent._agent_startup()
         await self.agent.agent_on_startup()
         self._agent_startup_called = True
+        AcademyFlowceptProvenance.emit_lifecycle(
+            state=self._flowcept_state,
+            activity_id="academy.agent_startup",
+            agent_id=self.agent_id,
+            custom_metadata={
+                "academy": {
+                    "agent_type": type(self.agent).__name__,
+                    "agent_repr": repr(self.agent),
+                },
+            },
+        )
 
         self._started_event.set()
         logger.info(
@@ -637,6 +724,18 @@ class Runtime(Generic[AgentT], NoPickleMixin):
             # Don't call agent_on_shutdown() if we never called
             # agent_on_startup()
             await self.agent.agent_on_shutdown()
+            AcademyFlowceptProvenance.emit_lifecycle(
+                state=self._flowcept_state,
+                activity_id="academy.agent_shutdown",
+                agent_id=self.agent_id,
+                custom_metadata={
+                    "academy": {
+                        "agent_type": type(self.agent).__name__,
+                        "agent_repr": repr(self.agent),
+                        "expected_shutdown": self._shutdown_options.expected_shutdown,
+                    },
+                },
+            )
 
         await self.agent._agent_shutdown()
 
@@ -691,6 +790,8 @@ class Runtime(Generic[AgentT], NoPickleMixin):
                 'academy.agent': self.agent,
             },
         )
+        AcademyFlowceptProvenance.stop_runtime(self._flowcept_state)
+        self._flowcept_state = _RuntimeState(enabled=False)
 
     def signal_shutdown(
         self,
