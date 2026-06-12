@@ -31,6 +31,7 @@ from academy.message import ShutdownRequest
 from academy.message import SuccessResponse
 from academy.message import UserErrorResponse
 from academy.serialize import SerializationStrategy
+from academy.telemetry import inject_trace_context
 
 
 def test_check_version_good():
@@ -110,6 +111,41 @@ def test_response_message(message_body: Any) -> None:
     pickled = message.model_serialize()
     recreated = Message.model_deserialize(pickled)
     assert message == recreated
+
+
+def test_trace_context_serialization() -> None:
+    header = Header(
+        src=AgentId.new(),
+        dest=AgentId.new(),
+        tag=uuid.uuid4(),
+        kind='request',
+        trace_context={'traceparent': '00-test'},
+    )
+    message: Message[Any] = Message(header=header, body=PingRequest())
+
+    jsoned = message.model_dump_json()
+    recreated: Message[Any] = Message.model_validate_json(jsoned)
+
+    assert recreated.header.trace_context == {'traceparent': '00-test'}
+    response = recreated.create_response(SuccessResponse())
+    assert response.header.trace_context == {'traceparent': '00-test'}
+
+
+def test_inject_trace_context_returns_message_copy(monkeypatch) -> None:
+    def inject(carrier: dict[str, str]) -> None:
+        carrier['traceparent'] = '00-test'
+
+    monkeypatch.setattr('academy.telemetry.inject', inject)
+    message = Message.create(
+        src=AgentId.new(),
+        dest=AgentId.new(),
+        body=PingRequest(),
+    )
+
+    injected = inject_trace_context(message)
+
+    assert message.header.trace_context is None
+    assert injected.header.trace_context == {'traceparent': '00-test'}
 
 
 def test_deserialize_bad_type() -> None:

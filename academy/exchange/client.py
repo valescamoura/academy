@@ -36,6 +36,8 @@ from academy.message import ErrorCode
 from academy.message import Message
 from academy.message import RequestT_co
 from academy.task import spawn_guarded_background_task
+from academy.telemetry import inject_trace_context
+from academy.telemetry import use_message_trace_context
 
 if TYPE_CHECKING:
     from academy.agent import Agent
@@ -221,6 +223,7 @@ class ExchangeClient(abc.ABC, Generic[ExchangeTransportT]):
             BadEntityIdError: If a mailbox for `message.dest` does not exist.
             MailboxTerminatedError: If the mailbox was closed.
         """
+        message = inject_trace_context(message)
         await self._transport.send(message)
         logger.debug(
             'Sent %s to %s',
@@ -291,7 +294,8 @@ class ExchangeClient(abc.ABC, Generic[ExchangeTransportT]):
                     self.client_id,
                     extra=message.log_extra(),
                 )
-                await self._handle_message(message)
+                with use_message_trace_context(message):
+                    await self._handle_message(message)
 
                 if sys.version_info < (3, 12):  # pragma: <3.12 cover
                     await asyncio.sleep(0)

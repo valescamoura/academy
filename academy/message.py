@@ -401,6 +401,10 @@ class Header(BaseModel):
             'existing fields without prohibiting their existence.'
         ),
     )
+    trace_context: dict[str, str] | None = Field(
+        None,
+        description='Optional distributed tracing context carrier.',
+    )
 
     model_config = DEFAULT_FROZEN_CONFIG
 
@@ -426,6 +430,7 @@ class Header(BaseModel):
             dest=self.src,
             label=self.label,
             kind='response',
+            trace_context=self.trace_context,
         )
 
 
